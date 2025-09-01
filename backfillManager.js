@@ -33,10 +33,10 @@ class BackfillManager {
       const toBlock = currentBlock;
       
       // Only backfill if there's actually a gap (more than 1 block difference)
-      if (this.blockStorage.isValidBlockRange(fromBlock, toBlock)) {
+      if (this.blockStorage.isValidBlockRange(fromBlock, toBlock) && fromBlock < toBlock) {
         await this.performBackfill(fromBlock, toBlock, eventHandlers);
       }
-      // No warning for consecutive blocks - this is normal operation
+      // No backfill needed for consecutive blocks - this is normal operation
     }
     
     // Update in-memory lastSeenBlock and save to storage
