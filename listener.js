@@ -9,6 +9,7 @@ let reconnectAttempts = 0;
 const MAX_RECONNECTS = 5;
 
 let lastBlockTime = Date.now();
+let lastSeenBlock = null;
 
 const FASTAPI_BASE_URL = process.env.FASTAPI_BASE_URL;
 const LISTENER_SECRET  = process.env.LISTENER_WEBHOOK_SECRET;
@@ -123,11 +124,29 @@ function setupListeners() {
   provider = new ethers.WebSocketProvider(process.env.RPC_WS_URL);
   contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, abi, provider);
 
+  contract.removeAllListeners(); 
+  console.log("🧹 Removed existing listeners.");
 
   // Keep-alive
-  provider.on("block", (blockNumber) => {
+  provider.on("block", async (blockNumber) => {
     console.log("💓 New block:", blockNumber);
     lastBlockTime = Date.now();
+    // Backfill missed events
+    if (lastSeenBlock && blockNumber > lastSeenBlock) {
+      const fromBlock = lastSeenBlock + 1;
+      const toBlock = blockNumber;
+      try {
+        const createdEvents = await contract.queryFilter("OrderCreated", fromBlock, toBlock);
+        createdEvents.forEach(e => handleOrderCreated(e));
+        const settledEvents = await contract.queryFilter("OrderSettled", fromBlock, toBlock);
+        settledEvents.forEach(e => handleOrderSettled(e));
+        const refundedEvents = await contract.queryFilter("OrderRefunded", fromBlock, toBlock);
+        refundedEvents.forEach(e => handleOrderRefunded(e));
+      } catch (err) {
+        console.error("❌ Error during backfill:", err.message);
+      }
+    }
+    lastSeenBlock = blockNumber;
   });
 
   // Reconnect if no blocks are received for 60s
