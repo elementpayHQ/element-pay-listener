@@ -9,6 +9,7 @@ class BackfillManager {
     this.contract = contract;
     this.blockStorage = new BlockStorage(chainName);
     this.chainName = chainName;
+    this.lastSeenBlock = null; // Keep track of last seen block in memory
   }
 
   /**
@@ -16,7 +17,8 @@ class BackfillManager {
    * @returns {number|null} The last seen block number
    */
   initialize() {
-    return this.blockStorage.loadLastSeenBlock();
+    this.lastSeenBlock = this.blockStorage.loadLastSeenBlock();
+    return this.lastSeenBlock;
   }
 
   /**
@@ -25,22 +27,20 @@ class BackfillManager {
    * @param {Object} eventHandlers - Object containing event handler functions
    */
   async handleNewBlock(currentBlock, eventHandlers) {
-    const lastSeenBlock = this.blockStorage.loadLastSeenBlock();
-    
-    // Check if we need to backfill
-    if (lastSeenBlock && currentBlock > lastSeenBlock) {
-      const fromBlock = lastSeenBlock + 1;
+    // Check if we need to backfill using in-memory lastSeenBlock
+    if (this.lastSeenBlock && currentBlock > this.lastSeenBlock) {
+      const fromBlock = this.lastSeenBlock + 1;
       const toBlock = currentBlock;
       
-      // Validate block range - must have at least 1 block difference
+      // Only backfill if there's actually a gap (more than 1 block difference)
       if (this.blockStorage.isValidBlockRange(fromBlock, toBlock) && fromBlock < toBlock) {
         await this.performBackfill(fromBlock, toBlock, eventHandlers);
-      } else {
-        console.log(`⚠️ Skipping backfill: invalid block range (from: ${fromBlock}, to: ${toBlock}) for ${this.chainName}`);
       }
+      // No backfill needed for consecutive blocks - this is normal operation
     }
     
-    // Update and save the current block
+    // Update in-memory lastSeenBlock and save to storage
+    this.lastSeenBlock = currentBlock;
     this.blockStorage.saveLastSeenBlock(currentBlock);
   }
 
@@ -80,11 +80,11 @@ class BackfillManager {
   }
 
   /**
-   * Get the current last seen block from storage
+   * Get the current last seen block from memory
    * @returns {number|null} The last seen block number
    */
   getLastSeenBlock() {
-    return this.blockStorage.loadLastSeenBlock();
+    return this.lastSeenBlock;
   }
 
   /**
