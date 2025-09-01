@@ -32,12 +32,11 @@ class BackfillManager {
       const fromBlock = this.lastSeenBlock + 1;
       const toBlock = currentBlock;
       
-      // Validate block range - must have at least 1 block difference
-      if (this.blockStorage.isValidBlockRange(fromBlock, toBlock) && fromBlock < toBlock) {
+      // Only backfill if there's actually a gap (more than 1 block difference)
+      if (this.blockStorage.isValidBlockRange(fromBlock, toBlock)) {
         await this.performBackfill(fromBlock, toBlock, eventHandlers);
-      } else {
-        console.log(`⚠️ Skipping backfill: invalid block range (from: ${fromBlock}, to: ${toBlock}) for ${this.chainName}`);
       }
+      // No warning for consecutive blocks - this is normal operation
     }
     
     // Update in-memory lastSeenBlock and save to storage
