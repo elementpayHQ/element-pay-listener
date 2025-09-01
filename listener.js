@@ -35,13 +35,27 @@ async function postSigned(path, payload) {
     },
   });
 }
+
+const processedOrderCreated = new Set();
+const processedOrderSettled = new Set();
+const processedOrderRefunded = new Set();
+
 // --- Setup Event Handlers ---
 async function handleOrderCreated(...args) {
   const event = args[args.length - 1];
+  const orderId = event.args?.orderId?.toString() || "";
+
+  // Idempotency check
+  if (processedOrderCreated.has(orderId)) {
+    console.log(`⏩ Skipping duplicate OrderCreated for orderId: ${orderId}`);
+    return;
+  }
+  processedOrderCreated.add(orderId);
+
   console.log("📥 OrderCreated received:", event.args);
 
   const payload = {
-    orderId: event.args?.orderId?.toString() || "",
+    orderId: orderId,
     requester: event.args?.requester || "",
     token: event.args?.token || "",
     amount: event.args?.amount?.toString() || "0",
@@ -68,10 +82,18 @@ async function handleOrderCreated(...args) {
 
 async function handleOrderSettled(...args) {
   const event = args[args.length - 1];
+  const orderId = event.args?.orderId?.toString() || event.args[0]?.toString() || "";
+  // Idempotency check
+  if (processedOrderSettled.has(orderId)) {
+    console.log(`⏩ Skipping duplicate OrderSettled for orderId: ${orderId}`);
+    return;
+  }
+  processedOrderSettled.add(orderId);
+
   console.log("📥 OrderSettled received:", event.args);
 
   const payload = {
-    orderId: event.args?.orderId || event.args[0],
+    orderId: orderId,
     transactionHash: event?.log?.transactionHash || null
   };
 
@@ -86,11 +108,19 @@ async function handleOrderSettled(...args) {
 
 async function handleOrderRefunded(...args) {
   const event = args[args.length - 1];
+  const orderId = event.args?.orderId?.toString() || event.args[0]?.toString() || "";
+
+  // Idempotency check
+  if (processedOrderRefunded.has(orderId)) {
+    console.log(`⏩ Skipping duplicate OrderRefunded for orderId: ${orderId}`);
+    return;
+  }
+  processedOrderRefunded.add(orderId);
 
   console.log("📥 OrderRefunded received:", event.args);
 
   const payload = {
-    orderId: event.args?.orderId || event.args[0],
+    orderId: orderId,
     transactionHash: event?.log?.transactionHash || null
   };
 
