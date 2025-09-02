@@ -3,15 +3,23 @@ const { ethers } = require('ethers');
 const { createHmac } = require('node:crypto');
 const axios = require('axios');
 const abi = require('./abi.json');
+const BackfillManager = require('./backfillManager');
+const BlockStorage = require('./blockStorage');
 
 let provider, contract;
 let reconnectAttempts = 0;
 const MAX_RECONNECTS = 5;
 
 let lastBlockTime = Date.now();
+let backfillManager = null;
+
+// Chain configuration
+const LISTENER_CHAIN = process.env.LISTENER_CHAIN || 'unknown';
 
 const FASTAPI_BASE_URL = process.env.FASTAPI_BASE_URL;
 const LISTENER_SECRET  = process.env.LISTENER_WEBHOOK_SECRET;
+
+
 
 function signBody(timestamp, rawBody) {
   const mac = createHmac('sha256', Buffer.from(LISTENER_SECRET, 'utf8'))
@@ -34,13 +42,27 @@ async function postSigned(path, payload) {
     },
   });
 }
+
+const processedOrderCreated = new Set();
+const processedOrderSettled = new Set();
+const processedOrderRefunded = new Set();
+
 // --- Setup Event Handlers ---
 async function handleOrderCreated(...args) {
   const event = args[args.length - 1];
+  const orderId = event.args?.orderId?.toString() || "";
+
+  // Idempotency check
+  if (processedOrderCreated.has(orderId)) {
+    console.log(`⏩ Skipping duplicate OrderCreated for orderId: ${orderId}`);
+    return;
+  }
+  processedOrderCreated.add(orderId);
+
   console.log("📥 OrderCreated received:", event.args);
 
   const payload = {
-    orderId: event.args?.orderId?.toString() || "",
+    orderId: orderId,
     requester: event.args?.requester || "",
     token: event.args?.token || "",
     amount: event.args?.amount?.toString() || "0",
@@ -67,10 +89,18 @@ async function handleOrderCreated(...args) {
 
 async function handleOrderSettled(...args) {
   const event = args[args.length - 1];
+  const orderId = event.args?.orderId?.toString() || event.args[0]?.toString() || "";
+  // Idempotency check
+  if (processedOrderSettled.has(orderId)) {
+    console.log(`⏩ Skipping duplicate OrderSettled for orderId: ${orderId}`);
+    return;
+  }
+  processedOrderSettled.add(orderId);
+
   console.log("📥 OrderSettled received:", event.args);
 
   const payload = {
-    orderId: event.args?.orderId || event.args[0],
+    orderId: orderId,
     transactionHash: event?.log?.transactionHash || null
   };
 
@@ -85,11 +115,19 @@ async function handleOrderSettled(...args) {
 
 async function handleOrderRefunded(...args) {
   const event = args[args.length - 1];
+  const orderId = event.args?.orderId?.toString() || event.args[0]?.toString() || "";
+
+  // Idempotency check
+  if (processedOrderRefunded.has(orderId)) {
+    console.log(`⏩ Skipping duplicate OrderRefunded for orderId: ${orderId}`);
+    return;
+  }
+  processedOrderRefunded.add(orderId);
 
   console.log("📥 OrderRefunded received:", event.args);
 
   const payload = {
-    orderId: event.args?.orderId || event.args[0],
+    orderId: orderId,
     transactionHash: event?.log?.transactionHash || null
   };
 
@@ -120,14 +158,33 @@ function reconnectWithBackoff() {
 // --- Setup Listeners ---
 function setupListeners() {
   console.log("🔧 Initializing provider and listeners...");
+  
+  // Clean up old storage files on startup (senior dev practice)
+  BlockStorage.cleanupOldFiles();
+  
   provider = new ethers.WebSocketProvider(process.env.RPC_WS_URL);
   contract = new ethers.Contract(process.env.CONTRACT_ADDRESS, abi, provider);
+  
+  // Initialize backfill manager
+  backfillManager = new BackfillManager(contract, LISTENER_CHAIN);
+  backfillManager.initialize();
 
+  contract.removeAllListeners(); 
+  console.log("🧹 Removed existing listeners.");
 
   // Keep-alive
-  provider.on("block", (blockNumber) => {
+  provider.on("block", async (blockNumber) => {
     console.log("💓 New block:", blockNumber);
     lastBlockTime = Date.now();
+    
+    // Handle backfill through the BackfillManager
+    if (backfillManager) {
+      await backfillManager.handleNewBlock(blockNumber, {
+        handleOrderCreated,
+        handleOrderSettled,
+        handleOrderRefunded
+      });
+    }
   });
 
   // Reconnect if no blocks are received for 60s
