@@ -78,11 +78,11 @@ async function handleOrderCreated(...args) {
   } catch (err) {
   if (err.response) {
     console.error("❌ OrderCreated forwarding failed with status:", err.response.status);
-    console.error("📨 Response data:", err.response.data);
+    console.error("Response data:", err.response.data);
   } else {
     console.error("❌ OrderCreated forwarding failed:", err.message);
   }
-  console.error("📦 Payload:", payload);
+  console.error("Payload:", payload);
 }
 
 }
