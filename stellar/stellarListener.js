@@ -39,10 +39,13 @@ const RPC_URL =
     : 'https://soroban-testnet.stellar.org');
 const FASTAPI_BASE_URL = process.env.FASTAPI_BASE_URL;
 const LISTENER_SECRET = process.env.LISTENER_WEBHOOK_SECRET;
-const POLL_MS = Math.max(2000, parseInt(process.env.POLL_MS || '4000', 10));
+const parsedPollMs = parseInt(process.env.POLL_MS || '4000', 10);
+const POLL_MS = Math.max(2000, Number.isFinite(parsedPollMs) ? parsedPollMs : 4000);
+const GET_EVENTS_LIMIT = 100;
+const GET_EVENTS_MAX_PAGES = 50;
 
 /**
- * Soroban contract IDs are full StrKey C-addresses (~56 chars), not abbreviated
+ * Soroban contract IDs are full StrKey C-addresses (exactly 56 chars), not abbreviated
  * explorer strings like "CCWG74…". Truncated / ellipsis IDs → RPC -32602
  * "contract ID 1 invalid".
  */
@@ -60,10 +63,11 @@ function assertValidContractId(id) {
     );
     process.exit(1);
   }
-  if (!/^C[A-Z2-7]{55,}$/i.test(id)) {
+  // StrKey C… is 56 uppercase base32 characters (no case-insensitive / over-long match).
+  if (!/^C[A-Z2-7]{55}$/.test(id)) {
     console.error(
       `STELLAR_ORDER_CONTRACT_ID invalid (length=${id.length} preview=${id.slice(0, 16)}…).\n` +
-        '  Expected a full StrKey starting with C (~56 chars).'
+        '  Expected a full StrKey starting with C (exactly 56 uppercase chars).'
     );
     process.exit(1);
   }
@@ -77,6 +81,10 @@ const processedCreated = new Set();
 const processedSettled = new Set();
 const processedRefunded = new Set();
 
+/** Process start + last successful poll (for /health). */
+const startedAt = Date.now();
+let lastPollOk = 0;
+
 function signBody(timestamp, rawBody) {
   const mac = createHmac('sha256', Buffer.from(LISTENER_SECRET, 'utf8'))
     .update(`${timestamp}.${rawBody}`, 'utf8')
@@ -89,6 +97,8 @@ async function postSigned(pathname, payload) {
   const raw = JSON.stringify(payload);
   const sig = signBody(ts, raw);
   return axios.post(`${FASTAPI_BASE_URL}${pathname}`, raw, {
+    timeout: 30000,
+    maxRedirects: 0,
     headers: {
       'Content-Type': 'application/json',
       'X-EP-Timestamp': ts,
@@ -232,14 +242,10 @@ function valueMap(ev) {
     if (Array.isArray(v.map)) {
       const out = {};
       for (const entry of v.map) {
-        const k =
-          entry.key?.symbol ||
-          entry.key?.string ||
-          entry?.key ||
-          entry[0]?.symbol ||
-          entry[0];
+        const rawKey = entry.key !== undefined ? entry.key : entry[0];
+        const k = unwrapScVal(rawKey);
         const val = entry.val !== undefined ? entry.val : entry.value ?? entry[1];
-        if (k != null) out[String(k)] = unwrapScVal(val);
+        if (k != null && k !== '') out[String(k)] = unwrapScVal(val);
       }
       return out;
     }
@@ -263,6 +269,8 @@ function unwrapScVal(val) {
   if (val.i128 != null) return String(val.i128);
   if (val.u128 != null) return String(val.u128);
   if (val.u32 != null) return Number(val.u32);
+  if (val.i32 != null) return Number(val.i32);
+  if (typeof val.bool === 'boolean') return val.bool;
   if (val.u64 != null) return String(val.u64);
   if (val.i64 != null) return String(val.i64);
   if (val.string != null) return String(val.string);
@@ -291,14 +299,16 @@ function unwrapScVal(val) {
  */
 function classifyEvent(ev) {
   const parts = topicsList(ev).map(topicParts);
+  // Exact lab layout first — substring fallbacks must not shadow these.
+  if (parts[0]?.text === 'order') {
+    if (parts[1]?.text === 'created') return 'created';
+    if (parts[1]?.text === 'settled') return 'settled';
+    if (parts[1]?.text === 'refunded') return 'refunded';
+  }
   const text = parts.map((p) => p.text.toLowerCase()).join(' ');
   if (text.includes('refund')) return 'refunded';
   if (text.includes('settle')) return 'settled';
   if (text.includes('create') || text.includes('created')) return 'created';
-  // symbol order + second topic
-  if (parts[0]?.text === 'order' && parts[1]?.text === 'created') return 'created';
-  if (parts[0]?.text === 'order' && parts[1]?.text === 'settled') return 'settled';
-  if (parts[0]?.text === 'order' && parts[1]?.text === 'refunded') return 'refunded';
   return null;
 }
 
@@ -334,7 +344,6 @@ async function handleCreated(ev) {
     return;
   }
   if (processedCreated.has(orderId)) return;
-  processedCreated.add(orderId);
 
   const vm = valueMap(ev);
   const requester =
@@ -360,6 +369,7 @@ async function handleCreated(ev) {
   };
   try {
     const res = await postSigned('/events/order-created', payload);
+    processedCreated.add(orderId);
     console.log('OrderCreated forwarded', payload.orderId, res.data);
   } catch (err) {
     console.error(
@@ -374,7 +384,6 @@ async function handleSettled(ev) {
   const orderId = orderIdFromEvent(ev);
   if (!orderId) return;
   if (processedSettled.has(orderId)) return;
-  processedSettled.add(orderId);
   const payload = {
     orderId,
     transactionHash: String(ev.txHash || ev.transactionHash || ''),
@@ -382,9 +391,14 @@ async function handleSettled(ev) {
   };
   try {
     const res = await postSigned('/events/order-settled', payload);
+    processedSettled.add(orderId);
     console.log('OrderSettled forwarded', payload.orderId, res.data);
   } catch (err) {
-    console.error('OrderSettled forward failed', err.message);
+    console.error(
+      'OrderSettled forward failed',
+      err.response?.status,
+      err.response?.data || err.message
+    );
   }
 }
 
@@ -392,7 +406,6 @@ async function handleRefunded(ev) {
   const orderId = orderIdFromEvent(ev);
   if (!orderId) return;
   if (processedRefunded.has(orderId)) return;
-  processedRefunded.add(orderId);
   const payload = {
     orderId,
     transactionHash: String(ev.txHash || ev.transactionHash || ''),
@@ -400,10 +413,78 @@ async function handleRefunded(ev) {
   };
   try {
     const res = await postSigned('/events/order-refunded', payload);
+    processedRefunded.add(orderId);
     console.log('OrderRefunded forwarded', payload.orderId, res.data);
   } catch (err) {
-    console.error('OrderRefunded forward failed', err.message);
+    console.error(
+      'OrderRefunded forward failed',
+      err.response?.status,
+      err.response?.data || err.message
+    );
   }
+}
+
+async function dispatchEvent(ev) {
+  const parts = topicsList(ev).map(topicParts);
+  const kind = classifyEvent(ev);
+  if (kind === 'created') await handleCreated(ev);
+  else if (kind === 'settled') await handleSettled(ev);
+  else if (kind === 'refunded') await handleRefunded(ev);
+  else {
+    // Make decode failures visible — silent unclassified was the Path A gap
+    const preview = parts
+      .map((p) => p.text || p.hex?.slice(0, 12) || p.address?.slice(0, 12) || p.kind)
+      .join('|');
+    console.warn(
+      'unclassified event ledger=%s tx=%s topics=%s',
+      ev.ledger || ev.ledgerCloseTime || '?',
+      String(ev.txHash || '').slice(0, 16),
+      preview
+    );
+  }
+}
+
+/**
+ * Fetch getEvents pages for [startLedger, …].
+ * First page uses startLedger; subsequent pages use pagination.cursor only.
+ */
+async function fetchEventsAllPages(startLedger, useJsonXdr) {
+  const all = [];
+  let cursor = null;
+  let latestLedger = null;
+  for (let page = 0; page < GET_EVENTS_MAX_PAGES; page += 1) {
+    const params = {
+      filters: [{ type: 'contract', contractIds: [CONTRACT_ID] }],
+      pagination: { limit: GET_EVENTS_LIMIT },
+    };
+    if (cursor) {
+      params.pagination.cursor = cursor;
+    } else {
+      params.startLedger = startLedger;
+    }
+    if (useJsonXdr) params.xdrFormat = 'json';
+
+    const result = await rpc('getEvents', params);
+    const batch = result.events || [];
+    all.push(...batch);
+    if (result.latestLedger != null) latestLedger = result.latestLedger;
+
+    const nextCursor =
+      result.cursor ||
+      result.pagingToken ||
+      (result.pagination && result.pagination.cursor) ||
+      null;
+    if (!nextCursor || batch.length === 0 || batch.length < GET_EVENTS_LIMIT) {
+      return { events: all, latestLedger, pages: page + 1 };
+    }
+    cursor = nextCursor;
+  }
+  console.warn(
+    'getEvents hit max pages=%s events=%s; raise GET_EVENTS_MAX_PAGES if lagging',
+    GET_EVENTS_MAX_PAGES,
+    all.length
+  );
+  return { events: all, latestLedger, pages: GET_EVENTS_MAX_PAGES };
 }
 
 async function pollOnce() {
@@ -424,52 +505,28 @@ async function pollOnce() {
     start = Math.max(1, latestSeq - 50);
   }
 
-  let result;
+  let fetched;
   try {
-    result = await rpc('getEvents', {
-      startLedger: start,
-      filters: [{ type: 'contract', contractIds: [CONTRACT_ID] }],
-      pagination: { limit: 100 },
-      xdrFormat: 'json',
-    });
+    fetched = await fetchEventsAllPages(start, true);
   } catch (e) {
     // Some nodes reject xdrFormat; retry base64 SCVal topics
     console.warn('getEvents xdrFormat=json failed (%s); retrying default', e.message || e);
-    result = await rpc('getEvents', {
-      startLedger: start,
-      filters: [{ type: 'contract', contractIds: [CONTRACT_ID] }],
-      pagination: { limit: 100 },
-    });
+    fetched = await fetchEventsAllPages(start, false);
   }
 
-  const events = result.events || [];
+  const events = fetched.events || [];
   console.log(
-    'poll startLedger=%s latest=%s events=%s',
+    'poll startLedger=%s latest=%s events=%s pages=%s',
     start,
-    result.latestLedger || latestSeq,
-    events.length
+    fetched.latestLedger || latestSeq,
+    events.length,
+    fetched.pages
   );
   for (const ev of events) {
-    const parts = topicsList(ev).map(topicParts);
-    const kind = classifyEvent(ev);
-    if (kind === 'created') await handleCreated(ev);
-    else if (kind === 'settled') await handleSettled(ev);
-    else if (kind === 'refunded') await handleRefunded(ev);
-    else {
-      // Make decode failures visible — silent unclassified was the Path A gap
-      const preview = parts
-        .map((p) => p.text || p.hex?.slice(0, 12) || p.address?.slice(0, 12) || p.kind)
-        .join('|');
-      console.warn(
-        'unclassified event ledger=%s tx=%s topics=%s',
-        ev.ledger || ev.ledgerCloseTime || '?',
-        String(ev.txHash || '').slice(0, 16),
-        preview
-      );
-    }
+    await dispatchEvent(ev);
   }
 
-  const next = Number(result.latestLedger || latestSeq);
+  const next = Number(fetched.latestLedger || latestSeq);
   if (Number.isFinite(next) && next >= start) {
     saveCursor(next);
   }
@@ -483,22 +540,48 @@ async function loop() {
     RPC_URL,
     FASTAPI_BASE_URL || '(missing)'
   );
+  let backoff = 0;
   for (;;) {
     try {
       await pollOnce();
+      lastPollOk = Date.now();
+      backoff = 0;
     } catch (e) {
       console.error('poll error', e.message || e);
+      backoff = Math.min(backoff ? backoff * 2 : POLL_MS, 60000);
     }
-    await new Promise((r) => setTimeout(r, POLL_MS));
+    await new Promise((r) => setTimeout(r, backoff || POLL_MS));
   }
 }
 
 const healthApp = express();
-healthApp.get('/health', (_req, res) =>
-  res.json({ ok: true, network: NETWORK, contract: CONTRACT_ID })
-);
+healthApp.get('/health', (_req, res) => {
+  const staleMs = Math.max(POLL_MS * 5, 30000);
+  let ageMs;
+  let ok;
+  if (lastPollOk) {
+    ageMs = Date.now() - lastPollOk;
+    ok = ageMs < staleMs;
+  } else {
+    // Grace period before first successful poll so deploy probes do not flap.
+    ageMs = Date.now() - startedAt;
+    ok = ageMs < staleMs;
+  }
+  res.status(ok ? 200 : 503).json({
+    ok,
+    lastPollAgeMs: lastPollOk ? ageMs : null,
+    network: NETWORK,
+    contract: CONTRACT_ID,
+  });
+});
 const healthPort = parseInt(process.env.STELLAR_HEALTH_PORT || '8089', 10);
-healthApp.listen(healthPort, () => console.log('health on', healthPort));
+const healthServer = healthApp.listen(healthPort, () =>
+  console.log('health on', healthPort)
+);
+healthServer.on('error', (e) => {
+  console.error('health server failed to bind port %s: %s', healthPort, e.message);
+  process.exit(1);
+});
 
 loop().catch((e) => {
   console.error('fatal', e);

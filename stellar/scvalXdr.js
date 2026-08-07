@@ -165,14 +165,20 @@ class XdrReader {
         return { symbol: this.opaque().toString('utf8') };
       }
       case 16: {
-        // VEC
+        // VEC — XDR optional pointer (SCVec*)
+        const present = this.u32();
+        if (present === 0) return { vec: null };
+        if (present !== 1) throw new Error(`invalid SCVec optional flag ${present}`);
         const n = this.u32();
         const vec = [];
         for (let i = 0; i < n; i += 1) vec.push(this.readScVal());
         return { vec };
       }
       case 17: {
-        // MAP
+        // MAP — XDR optional pointer (SCMap*)
+        const present = this.u32();
+        if (present === 0) return { map: null };
+        if (present !== 1) throw new Error(`invalid SCMap optional flag ${present}`);
         const n = this.u32();
         const map = [];
         for (let i = 0; i < n; i += 1) {
@@ -215,7 +221,10 @@ function decodeScValBase64(b64) {
     const buf = Buffer.from(b64, 'base64');
     if (!buf.length) return null;
     const r = new XdrReader(buf);
-    return r.readScVal();
+    const v = r.readScVal();
+    // A full SCVal must consume the entire payload; leftovers mean wrong decode path.
+    if (r.remaining() !== 0) return null;
+    return v;
   } catch {
     return null;
   }
