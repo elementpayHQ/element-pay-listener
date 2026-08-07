@@ -16,6 +16,7 @@
  *   FASTAPI_BASE_URL=
  *   LISTENER_WEBHOOK_SECRET=
  *   POLL_MS=4000
+ *   STELLAR_HEALTH_PORT=8089  (do not reuse EVM HEALTH_PORT in a shared .env)
  */
 require('dotenv').config({
   // Local listener .env is source of truth — a prior bad `export STELLAR_…=CCWG74…`
@@ -496,7 +497,7 @@ const healthApp = express();
 healthApp.get('/health', (_req, res) =>
   res.json({ ok: true, network: NETWORK, contract: CONTRACT_ID })
 );
-const healthPort = parseInt(process.env.HEALTH_PORT || '8089', 10);
+const healthPort = parseInt(process.env.STELLAR_HEALTH_PORT || '8089', 10);
 healthApp.listen(healthPort, () => console.log('health on', healthPort));
 
 loop().catch((e) => {
