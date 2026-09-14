@@ -16,7 +16,12 @@
   {
     "anonymous": false,
     "inputs": [
-      { "indexed": true, "name": "orderId", "type": "bytes32" }
+      { "indexed": true, "name": "orderId", "type": "bytes32" },
+      { "indexed": true, "name": "token", "type": "address" },
+      { "indexed": true, "name": "requester", "type": "address" },
+      { "indexed": false, "name": "netAmount", "type": "uint256" },
+      { "indexed": false, "name": "feeAmount", "type": "uint256" },
+      { "indexed": false, "name": "providerId", "type": "bytes32" }
     ],
     "name": "OrderSettled",
     "type": "event"
@@ -24,7 +29,10 @@
   {
     "anonymous": false,
     "inputs": [
-      { "indexed": true, "name": "orderId", "type": "bytes32" }
+      { "indexed": true, "name": "orderId", "type": "bytes32" },
+      { "indexed": true, "name": "token", "type": "address" },
+      { "indexed": true, "name": "requester", "type": "address" },
+      { "indexed": false, "name": "amount", "type": "uint256" }
     ],
     "name": "OrderRefunded",
     "type": "event"
