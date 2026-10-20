@@ -5,6 +5,7 @@ const axios = require('axios');
 const abi = require('./abi.json');
 const BackfillManager = require('./backfillManager');
 const BlockStorage = require('./blockStorage');
+const { createForwarder } = require('./forwarder');
 
 let provider, contract;
 let reconnectAttempts = 0;
@@ -12,6 +13,7 @@ const MAX_RECONNECTS = 5;
 
 let lastBlockTime = Date.now();
 let backfillManager = null;
+let staleWatchdog = null;
 
 // Chain configuration
 const LISTENER_CHAIN = process.env.LISTENER_CHAIN || 'unknown';
@@ -43,21 +45,19 @@ async function postSigned(path, payload) {
   });
 }
 
-const processedOrderCreated = new Set();
-const processedOrderSettled = new Set();
-const processedOrderRefunded = new Set();
+// Events are marked as handled only after the backend accepts them, so a
+// failed delivery is retried when the event is seen again (live or backfill).
+const forwarder = createForwarder({ post: postSigned });
 
 // --- Setup Event Handlers ---
 async function handleOrderCreated(...args) {
   const event = args[args.length - 1];
   const orderId = event.args?.orderId?.toString() || "";
 
-  // Idempotency check
-  if (processedOrderCreated.has(orderId)) {
+  if (forwarder.isDelivered(`OrderCreated:${orderId}`)) {
     console.log(`⏩ Skipping duplicate OrderCreated for orderId: ${orderId}`);
     return;
   }
-  processedOrderCreated.add(orderId);
 
   console.log("📥 OrderCreated received:", event.args);
 
@@ -71,31 +71,17 @@ async function handleOrderCreated(...args) {
     transactionHash: event.log?.transactionHash?.toString() || ""
   };
 
-  try {
-    const res = await postSigned("/events/order-created", payload);
-
-    console.log("✅ OrderCreated forwarded:", res.data);
-  } catch (err) {
-  if (err.response) {
-    console.error("❌ OrderCreated forwarding failed with status:", err.response.status);
-    console.error("📨 Response data:", err.response.data);
-  } else {
-    console.error("❌ OrderCreated forwarding failed:", err.message);
-  }
-  console.error("📦 Payload:", payload);
-}
-
+  const result = await forwarder.forward(`OrderCreated:${orderId}`, "/events/order-created", payload);
+  if (result.status === 'delivered') console.log("✅ OrderCreated forwarded:", result.response?.data);
 }
 
 async function handleOrderSettled(...args) {
   const event = args[args.length - 1];
   const orderId = event.args?.orderId?.toString() || event.args[0]?.toString() || "";
-  // Idempotency check
-  if (processedOrderSettled.has(orderId)) {
+  if (forwarder.isDelivered(`OrderSettled:${orderId}`)) {
     console.log(`⏩ Skipping duplicate OrderSettled for orderId: ${orderId}`);
     return;
   }
-  processedOrderSettled.add(orderId);
 
   console.log("📥 OrderSettled received:", event.args);
 
@@ -104,25 +90,18 @@ async function handleOrderSettled(...args) {
     transactionHash: event?.log?.transactionHash || null
   };
 
-  try {
-    const res = await postSigned("/events/order-settled", payload);
-    console.log("✅ OrderSettled forwarded:", res.data);
-  } catch (err) {
-    console.error("❌ OrderSettled forwarding failed:", err.message);
-    console.error("📦 Payload:", payload);
-  }
+  const result = await forwarder.forward(`OrderSettled:${orderId}`, "/events/order-settled", payload);
+  if (result.status === 'delivered') console.log("✅ OrderSettled forwarded:", result.response?.data);
 }
 
 async function handleOrderRefunded(...args) {
   const event = args[args.length - 1];
   const orderId = event.args?.orderId?.toString() || event.args[0]?.toString() || "";
 
-  // Idempotency check
-  if (processedOrderRefunded.has(orderId)) {
+  if (forwarder.isDelivered(`OrderRefunded:${orderId}`)) {
     console.log(`⏩ Skipping duplicate OrderRefunded for orderId: ${orderId}`);
     return;
   }
-  processedOrderRefunded.add(orderId);
 
   console.log("📥 OrderRefunded received:", event.args);
 
@@ -131,13 +110,8 @@ async function handleOrderRefunded(...args) {
     transactionHash: event?.log?.transactionHash || null
   };
 
-  try {
-    const res = await postSigned("/events/order-refunded", payload);
-    console.log("✅ OrderRefunded forwarded:", res.data);
-  } catch (err) {
-    console.error("❌ OrderRefunded forwarding failed:", err.message);
-    console.error("📦 Payload:", payload);
-  }
+  const result = await forwarder.forward(`OrderRefunded:${orderId}`, "/events/order-refunded", payload);
+  if (result.status === 'delivered') console.log("✅ OrderRefunded forwarded:", result.response?.data);
 }
 
 // --- Reconnection Logic ---
@@ -187,10 +161,14 @@ function setupListeners() {
     }
   });
 
-  // Reconnect if no blocks are received for 60s
-  setInterval(() => {
+  // Reconnect if no blocks are received for 60s. setupListeners() runs on
+  // every reconnect, so clear the previous watchdog first; otherwise each
+  // reconnect adds another timer and a later stall reconnects once per timer.
+  if (staleWatchdog) clearInterval(staleWatchdog);
+  staleWatchdog = setInterval(() => {
     if (Date.now() - lastBlockTime > 60000) {
       console.warn("⚠️ No blocks for 60s. Forcing reconnect...");
+      lastBlockTime = Date.now(); // give the new connection a full window
       provider.destroy?.(); // ethers v6
       setupListeners(); // Reinitialize
     }
